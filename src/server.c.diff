@@ -1,13 +1,15 @@
 diff --git a/src/server.c b/src/server.c
-index c6e5efe..c9e9855 100644
+index c6e5efe..db3dea6 100644
 --- a/src/server.c
 +++ b/src/server.c
-@@ -27,6 +27,123 @@
+@@ -27,6 +27,125 @@
  
  #define ERRCODE_CANNOT_CONNECT_NOW "57P03"
  
 +bool routing_traffic_to_target_complete = false;
 +bool source_instance_down_before_switchover = false;
++/* Stores the new port number set by customer for the green (target) instance during Blue-Green Deployment. */
++int changed_port_num = 0;
 +
 +/**
 + * Extracts and processes query result data from a packet into a tab-separated string.
@@ -126,7 +128,7 @@ index c6e5efe..c9e9855 100644
  static bool load_parameter(PgSocket *server, PktHdr *pkt, bool startup)
  {
  	const char *key, *val;
-@@ -122,6 +239,8 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
+@@ -122,6 +241,8 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
  	const char *msg;
  	bool res = false;
  	const uint8_t *ckey;
@@ -135,7 +137,7 @@ index c6e5efe..c9e9855 100644
  
  	if (incomplete_pkt(pkt)) {
  		disconnect_server(server, true, "partial pkt in login phase");
-@@ -133,12 +252,28 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
+@@ -133,12 +254,28 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
  		switch (pkt->type) {
  		case PqMsg_ReadyForQuery:
  		case PqMsg_ParameterStatus:
@@ -164,7 +166,7 @@ index c6e5efe..c9e9855 100644
  		/* fallthrough */
  		default:	/* ignore rest */
  			sbuf_prepare_skip(sbuf, pkt->len);
-@@ -152,6 +287,52 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
+@@ -152,6 +289,52 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
  		disconnect_server(server, true, "unknown pkt from server");
  		break;
  
@@ -217,7 +219,7 @@ index c6e5efe..c9e9855 100644
  	case PqMsg_ErrorResponse:
  		/*
  		 * If we cannot log into the server, then we drop all clients
-@@ -201,7 +382,60 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
+@@ -201,7 +384,60 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
  			if (!res)
  				disconnect_server(server, false, "exec_on_connect query failed");
  			break;
@@ -278,16 +280,19 @@ index c6e5efe..c9e9855 100644
  
  		/* login ok */
  		slog_debug(server, "server login ok, start accepting queries");
-@@ -363,6 +597,8 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+@@ -363,6 +599,11 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
  	bool async_response = false;
  	struct List *item, *tmp;
  	bool ignore_packet = false;
 +	bool res = false;
-+	PgPool *next_pool;
++	PgPool *next_pool = NULL;
++	TopologyData *topology = NULL;
++	char *data = NULL;
++	PgDatabase *db = NULL;
  
  	Assert(!server->pool->db->admin);
  
-@@ -374,6 +610,15 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+@@ -374,6 +615,15 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
  
  	/* pooling decisions will be based on this packet */
  	case PqMsg_ReadyForQuery:
@@ -303,7 +308,7 @@ index c6e5efe..c9e9855 100644
  
  		/* if partial pkt, wait */
  		if (!mbuf_get_char(&pkt->data, &state))
-@@ -461,6 +706,22 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+@@ -461,6 +711,37 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
  		break;
  
  	case PqMsg_CommandComplete:
@@ -321,12 +326,27 @@ index c6e5efe..c9e9855 100644
 +			 */
 +			log_debug("handle_server_work: switchover started retrying to get the state of Blue Green deployment, db_name: %s", server->pool->db->name);
 +			server->pool->checking_for_new_writer = false;
++		} else if (fast_switchover && server->pool->db->blue_green_topology_query_job) {
++			/*
++			 * Topology query execution completed, but PqMsg_DataRow handler wasn't triggered.
++			 * This means the topology query returned no results, indicating the
++			 * topology table is empty. Since fast switchover requires topology
++			 * data to function properly, so we must disable this feature now.
++			 */
++			server->pool->db->blue_green_topology_query_job = false;
++			fast_switchover =  false;
++			statlist_for_each_safe(item, &database_list, tmp) {
++				db = container_of(item, PgDatabase, head);
++				if (db->blue_green_deployment_db_type == BLUE_GREEN_TARGET) {
++					kill_database(db);
++				}
++			}
 +		}
 +
  		/* ErrorResponse and CommandComplete show end of copy mode */
  		if (server->copy_mode) {
  			slog_debug(server, "COPY finished");
-@@ -545,6 +806,62 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+@@ -545,6 +826,170 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
  	/* data packets, there will be more coming */
  	case PqMsg_CopyData:
  	case PqMsg_DataRow:
@@ -376,7 +396,7 @@ index c6e5efe..c9e9855 100644
 +					if (!next_pool->last_connect_failed) {
 +						continue;
 +					}
-+					log_debug("launch_recheck: establishing new connection to pool: %s", next_pool->db->name);
++					log_debug("handle_server_work: establishing new connection to pool: %s", next_pool->db->name);
 +					launch_new_connection(next_pool, /* evict_if_needed= */ true);
 +				}
 +				source_instance_down_before_switchover = true;
@@ -385,11 +405,119 @@ index c6e5efe..c9e9855 100644
 +			}
 +			server->pool->checking_for_new_writer = false;
 +			free(data);
++		} else if (fast_switchover && server->pool->db->blue_green_topology_query_job) {
++			/*
++			 * If the target instance pool is in a failed state,
++			 * 1. Parse the topology data from the current packet.
++			 * 2. If the role is BLUE_GREEN_DEPLOYMENT_SOURCE, skip processing the packet.
++			 * 3. Allocate memory for the hostname.
++			 * 4. Set up the connection pool based on the endpoint type.
++			 * 5. If the hostname has changed, kill the existing database.
++			 * 6. Create a new pool using the updated topology data.
++			 * 7. Set the new pool's parent pool to the server's parent pool.
++			 */
++			data = query_data(pkt);
++			// Parse the topology data received from the metadata query
++			topology = parse_topology_data(server, data);
++			if (!topology) {
++				free(data);
++				fatal("failed to parse topology data for Blue Green Deployment");
++			}
++			// If the role is still source — skip processing
++			if (strcmp(topology->role, BLUE_GREEN_DEPLOYMENT_SOURCE) == 0) {
++				free(data);
++				cleanup_topology(topology);
++				sbuf_prepare_skip(sbuf, pkt->len);
++				return true;
++			}
++
++			/*
++			 * Blue-Green Deployment Fast Switchover:
++			 * Open connections only to the specified endpoint and its green counterpart; skip all other endpoints.
++			 * Connection Pool Handling:
++			 * - For writer endpoints (e.g., used with PgBouncer), ensure a connection is established to the corresponding writer on the green cluster.
++			 * - For reader endpoints, establish a connection to the equivalent reader on the green cluster.
++			 * - Apply the same logic for custom-defined endpoints.
++			 */
++			bool should_continue = setup_connection_pool_based_on_endpoint_type(server->pool->db->host, &topology->endpoint);
++			if (!should_continue) {
++				free(data);
++				cleanup_topology(topology);
++				sbuf_prepare_skip(sbuf, pkt->len);
++				return true;
++			}
++
++			/*
++			 * If the green (target) instance is down:
++			 * 1. Look through the pool list to find the target instance's pool.
++			 * 2. If the pool is found and it's not marked as failed.
++			 *    or if the endpoint and port haven't changed,
++			 *    then reset the blue-green topology job flags,
++			 *    skip processing this packet, and return.
++			 */
++			statlist_for_each(item, &pool_list) {
++				next_pool = container_of(item, PgPool, head);
++				if (next_pool->db->blue_green_deployment_db_type == BLUE_GREEN_TARGET) {
++					if (next_pool->last_connect_failed || next_pool->db->port != topology->port_num || strcmp(next_pool->db->host, topology->endpoint) != 0)
++						break;
++
++					// If a healthy green (target) instance is found, skip further recovery
++					server->pool->db->blue_green_topology_query_job = false;
++					free(data);
++					cleanup_topology(topology);
++					sbuf_prepare_skip(sbuf, pkt->len);
++					return true;
++				}
++			}
++			// If the target instance pool is not found.
++			if (next_pool->db->blue_green_deployment_db_type != BLUE_GREEN_TARGET) {
++				free(data);
++				cleanup_topology(topology);
++				fatal("handle_server_work: Missing connection pool entry for Blue-Green target. This should not happen during Blue-Green Deployment.");
++			}
++
++			if (strcmp(next_pool->db->host, topology->endpoint) != 0) {
++				// Kill the existing pool for the outdated target before reinitializing
++				log_debug("handle_server_work: Detected a change in the green db name. Killing the existing database connection. db_name: %s,", next_pool->db->name);
++				kill_database(next_pool->db);
++			} else {
++				// Pool matches new topology info, reuse it directly
++				// If port or host has changed, update and reset the target pool
++				if (next_pool->db->port != topology->port_num) {
++					changed_port_num = topology->port_num;
++					next_pool->db->port = topology->port_num;
++				}
++				free(data);
++				cleanup_topology(topology);
++				server->pool->db->blue_green_topology_query_job = false;
++				launch_new_connection(next_pool, true);
++				sbuf_prepare_skip(sbuf, pkt->len);
++				return true;
++			}
++
++			// Set up a new pool with the updated endpoint and topology information
++			PgPool *new_pool = setup_new_pool(server, topology);
++			if (new_pool == NULL) {
++				// Handle setup failure if needed
++				log_debug("Tried setting up the pool for Host : %s", topology->endpoint);
++				cleanup_topology(topology);
++				free(data);
++				fatal("Not able to setup the pool");
++			} else {
++				// Link the new pool to the original parent pool
++				log_debug("handle_server_work: Successfully initialized new database connection. db_name: %s, port number: %d", next_pool->db->name, next_pool->db->port);
++				new_pool->parent_pool = server->pool->parent_pool;
++			}
++			cleanup_topology(topology);
++			free(data);
++			server->pool->db->blue_green_topology_query_job = false;
++			sbuf_prepare_skip(sbuf, pkt->len);
++			return true;
 +		}
  		break;
  	}
  	server->idle_tx = idle_tx;
-@@ -632,7 +949,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+@@ -632,7 +1077,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
  			}
  		}
  	} else {
@@ -398,7 +526,7 @@ index c6e5efe..c9e9855 100644
  			slog_warning(server,
  				     "got packet '%c' from server when not linked",
  				     pkt_desc(pkt));
-@@ -640,6 +957,19 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+@@ -640,6 +1085,19 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
  		sbuf_prepare_skip(sbuf, pkt->len);
  	}
  
@@ -418,7 +546,7 @@ index c6e5efe..c9e9855 100644
  	return true;
  }
  
-@@ -754,6 +1084,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+@@ -754,6 +1212,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
  	bool res = false;
  	PgSocket *server = container_of(sbuf, PgSocket, sbuf);
  	PgPool *pool = server->pool;
@@ -426,7 +554,7 @@ index c6e5efe..c9e9855 100644
  	PktHdr pkt;
  	char infobuf[96];
  
-@@ -768,8 +1099,18 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+@@ -768,8 +1227,18 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
  	case SBUF_EV_RECV_FAILED:
  		if (server->state == SV_ACTIVE_CANCEL)
  			disconnect_server(server, false, "successfully sent cancel request");
@@ -446,7 +574,7 @@ index c6e5efe..c9e9855 100644
  		break;
  	case SBUF_EV_SEND_FAILED:
  		disconnect_client(server->link, false, "unexpected eof");
-@@ -810,6 +1151,10 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+@@ -810,6 +1279,10 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
  		break;
  	case SBUF_EV_CONNECT_FAILED:
  		Assert(server->state == SV_LOGIN);
@@ -457,7 +585,7 @@ index c6e5efe..c9e9855 100644
  		disconnect_server(server, false, "connect failed");
  		break;
  	case SBUF_EV_CONNECT_OK:
-@@ -893,3 +1238,254 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+@@ -893,3 +1366,254 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
  		takeover_login_failed();
  	return res;
  }
