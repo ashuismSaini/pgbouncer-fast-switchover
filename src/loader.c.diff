@@ -1,16 +1,17 @@
 diff --git a/src/loader.c b/src/loader.c
-index 4018d78..19a4853 100644
+index 4018d78..09e1d2d 100644
 --- a/src/loader.c
 +++ b/src/loader.c
-@@ -32,6 +32,7 @@
+@@ -32,6 +32,8 @@
  
  bool any_user_level_timeout_set;
  bool any_user_level_client_timeout_set;
-+PgDatabase *fast_switchover_db;
++PgDatabase *fast_switchover_db[MAX_FAST_SWITCHOVER_DATABASES] = {NULL};
++int fast_switchover_configured_db_count = 0;
  
  /* parse parameter name before '=' */
  static char *cstr_get_key(char *p, char **dst_p)
-@@ -57,12 +58,20 @@ static char *cstr_unquote_value(char *p)
+@@ -57,12 +59,20 @@ static char *cstr_unquote_value(char *p)
  	while (1) {
  		if (!*p)
  			return NULL;
@@ -31,7 +32,7 @@ index 4018d78..19a4853 100644
  		*s++ = *p++;
  	}
  	/* terminate actual value */
-@@ -243,6 +252,81 @@ fail:
+@@ -243,6 +253,81 @@ fail:
  	free(host);
  	return false;
  }
@@ -113,7 +114,7 @@ index 4018d78..19a4853 100644
  /* fill PgDatabase from connstr */
  bool parse_database(void *base, const char *name, const char *connstr)
  {
-@@ -273,6 +357,8 @@ bool parse_database(void *base, const char *name, const char *connstr)
+@@ -273,6 +358,8 @@ bool parse_database(void *base, const char *name, const char *connstr)
  	char *datestyle = NULL;
  	char *timezone = NULL;
  	char *connect_query = NULL;
@@ -122,7 +123,7 @@ index 4018d78..19a4853 100644
  	char *appname = NULL;
  	char *auth_query = NULL;
  
-@@ -358,8 +444,35 @@ bool parse_database(void *base, const char *name, const char *connstr)
+@@ -358,8 +445,35 @@ bool parse_database(void *base, const char *name, const char *connstr)
  				goto fail;
  			}
  		} else if (strcmp("connect_query", key) == 0) {
@@ -158,7 +159,7 @@ index 4018d78..19a4853 100644
  		} else if (strcmp("application_name", key) == 0) {
  			appname = val;
  		} else if (strcmp("auth_query", key) == 0) {
-@@ -399,12 +512,16 @@ bool parse_database(void *base, const char *name, const char *connstr)
+@@ -399,12 +513,16 @@ bool parse_database(void *base, const char *name, const char *connstr)
  			changed = true;
  		} else if (!strcmpeq(connect_query, db->connect_query)) {
  			changed = true;
@@ -175,7 +176,7 @@ index 4018d78..19a4853 100644
  		}
  		if (changed)
  			tag_database_dirty(db);
-@@ -423,8 +540,14 @@ bool parse_database(void *base, const char *name, const char *connstr)
+@@ -423,8 +541,14 @@ bool parse_database(void *base, const char *name, const char *connstr)
  	db->server_lifetime = server_lifetime;
  	db->load_balance_hosts = load_balance_hosts;
  	free(db->connect_query);
@@ -190,12 +191,13 @@ index 4018d78..19a4853 100644
  
  	if (!set_param_value(&db->auth_dbname, auth_dbname))
  		goto fail;
-@@ -486,6 +609,9 @@ bool parse_database(void *base, const char *name, const char *connstr)
+@@ -486,6 +610,10 @@ bool parse_database(void *base, const char *name, const char *connstr)
  	/* remember dbname */
  	db->dbname = (char *)msg->buf + dbname_ofs;
  
-+	if (fast_switchover && db->topology_query)
-+		fast_switchover_db = db;
++	if (fast_switchover && db->topology_query) {
++		fast_switchover_db[fast_switchover_configured_db_count++] = db;
++	}
 +
  	free(tmp_connstr);
  	return true;
